@@ -65,28 +65,16 @@ jobs:
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
         shell: bash
 
-      - name: Pack zip (library at zip root) — Linux/macOS
-        if: matrix.goos != 'windows'
-        run: |
-          mkdir -p staging
-          cp codex-429-autoban.${{ matrix.ext }} staging/
-          asset="codex-429-autoban_${{ steps.ver.outputs.version }}_${{ matrix.goos }}_${{ matrix.goarch }}.zip"
-          ( cd staging && zip -X "../${asset}" codex-429-autoban.${{ matrix.ext }} )
-          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
-        shell: bash
+      - name: Pack zip (library at zip root)
         id: pack
-
-      - name: Pack zip (library at zip root) — Windows
-        if: matrix.goos == 'windows'
-        id: pack
+        shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path staging | Out-Null
           Copy-Item codex-429-autoban.${{ matrix.ext }} staging/
           $asset = "codex-429-autoban_${{ steps.ver.outputs.version }}_${{ matrix.goos }}_${{ matrix.goarch }}.zip"
           # Compress-Archive stores the file at the archive root when given a bare file path.
-          Compress-Archive -Path "staging\codex-429-autoban.${{ matrix.ext }}" -DestinationPath $asset -Force
+          Compress-Archive -Path "staging/codex-429-autoban.${{ matrix.ext }}" -DestinationPath $asset -Force
           "asset=$asset" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-        shell: pwsh
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
