@@ -3,7 +3,7 @@
 // It auto-disables a Codex credential after a 429 and auto-re-enables it
 // once the rate-limit window that was hit has refreshed.
 //
-// Two capabilities are registered:
+// Three capabilities are registered:
 //   - usage_plugin: observes every completed request. On a Codex 429 it reads
 //     the upstream x-codex-* response headers, decides whether the 5-hour
 //     window or the weekly cap was exhausted, and records the exact reset
@@ -12,6 +12,9 @@
 //     reset time has not yet passed (lazy re-enable, since CPA exposes no
 //     timer hook) and delegates the actual selection to the built-in
 //     round-robin scheduler.
+//   - management_api: exposes a small status page and authenticated API for
+//     manually clearing the in-memory ban state after the user resets Codex
+//     quota or uses a reset card upstream.
 package main
 
 /*
@@ -49,8 +52,10 @@ import "C"
 
 import (
 	"encoding/json"
+	"html"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -63,7 +68,7 @@ import (
 
 const (
 	pluginName    = "codex-429-autoban"
-	pluginVersion = "0.1.0"
+	pluginVersion = "0.2.0"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
@@ -80,6 +85,8 @@ const (
 	// usedPercentThreshold is the "this window is the one that tripped" marker.
 	// A 429 carries the window that exhausted at ~100% used.
 	usedPercentThreshold = 100
+
+	managementRoutePrefix = "/plugins/" + pluginName
 )
 
 // banStore holds, per credential, the time at which it may be used again.
@@ -139,6 +146,56 @@ func (s *banState) clearIfExpired(authID string, now time.Time) (stillBanned boo
 		return false
 	}
 	return true
+}
+
+// clearExpired removes every ban whose reset time has passed.
+func (s *banState) clearExpired(now time.Time) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	removed := 0
+	for authID, e := range s.bans {
+		if !now.Before(e.ResetAt) {
+			delete(s.bans, authID)
+			removed++
+			slog.Info("codex-429-autoban: auto re-enabled credential",
+				"auth_id", authID, "window", e.Window, "reset_at", e.ResetAt.Format(time.RFC3339))
+		}
+	}
+	return removed
+}
+
+// clear removes the ban for authID, if present.
+func (s *banState) clear(authID string) (banEntry, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.bans == nil {
+		return banEntry{}, false
+	}
+	e, ok := s.bans[authID]
+	if ok {
+		delete(s.bans, authID)
+	}
+	return e, ok
+}
+
+// clearAll removes every active ban and returns how many were removed.
+func (s *banState) clearAll() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := len(s.bans)
+	s.bans = make(map[string]banEntry)
+	return n
+}
+
+// snapshot returns a copy of the current bans for diagnostics / management UI.
+func (s *banState) snapshot() map[string]banEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]banEntry, len(s.bans))
+	for authID, e := range s.bans {
+		out[authID] = e
+	}
+	return out
 }
 
 func main() {}
@@ -203,6 +260,10 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return handleUsage(request)
 	case pluginabi.MethodSchedulerPick:
 		return handleSchedulerPick(request)
+	case pluginabi.MethodManagementRegister:
+		return okEnvelope(managementRegistration())
+	case pluginabi.MethodManagementHandle:
+		return handleManagement(request)
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
@@ -221,8 +282,9 @@ func pluginRegistration() registration {
 			ConfigFields:     []pluginapi.ConfigField{},
 		},
 		Capabilities: registrationCapability{
-			UsagePlugin: true,
-			Scheduler:   true,
+			UsagePlugin:   true,
+			Scheduler:     true,
+			ManagementAPI: true,
 		},
 	}
 }
@@ -398,6 +460,384 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 	})
 }
 
+// managementRegistration exposes a small Management API and resource page so
+// users can put an auth back into the pool after manually resetting Codex
+// quota or using a reset card. CPA does not provide a timer/event for that
+// upstream-side action, so manual unban is the reliable integration point.
+func managementRegistration() pluginapi.ManagementRegistrationResponse {
+	return pluginapi.ManagementRegistrationResponse{
+		Routes: []pluginapi.ManagementRoute{
+			{
+				Method:      http.MethodGet,
+				Path:        managementRoutePrefix + "/bans",
+				Description: "List Codex auths currently held out of the pool by codex-429-autoban.",
+			},
+			{
+				Method:      http.MethodPost,
+				Path:        managementRoutePrefix + "/unban",
+				Description: "Remove one Codex auth from the in-memory ban list. Body: {\"auth_id\":\"...\"}.",
+			},
+			{
+				Method:      http.MethodPost,
+				Path:        managementRoutePrefix + "/unban-all",
+				Description: "Remove every Codex auth from the in-memory ban list.",
+			},
+		},
+		Resources: []pluginapi.ResourceRoute{
+			{
+				Path:        "/status",
+				Menu:        "Codex 429 Autoban",
+				Description: "View and manually unban Codex credentials after a quota reset.",
+			},
+		},
+	}
+}
+
+func handleManagement(raw []byte) ([]byte, error) {
+	var req pluginapi.ManagementRequest
+	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
+		return nil, errUnmarshal
+	}
+	return okEnvelope(dispatchManagement(req))
+}
+
+func dispatchManagement(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	method := strings.ToUpper(strings.TrimSpace(req.Method))
+	if method == "" {
+		method = http.MethodGet
+	}
+
+	switch {
+	case method == http.MethodGet && matchesManagementPath(req.Path, "/bans"):
+		return jsonManagementResponse(http.StatusOK, currentBanStatus())
+	case method == http.MethodPost && matchesManagementPath(req.Path, "/unban"):
+		return handleManagementUnban(req)
+	case method == http.MethodPost && matchesManagementPath(req.Path, "/unban-all"):
+		return handleManagementUnbanAll()
+	case method == http.MethodGet && matchesResourcePath(req.Path, "/status"):
+		return htmlManagementResponse(http.StatusOK, managementStatusPage())
+	default:
+		return jsonManagementResponse(http.StatusNotFound, map[string]any{
+			"error":  "not_found",
+			"path":   req.Path,
+			"method": method,
+		})
+	}
+}
+
+type managementBanStatus struct {
+	Plugin  string              `json:"plugin"`
+	Version string              `json:"version"`
+	Count   int                 `json:"count"`
+	Bans    []managementBanInfo `json:"bans"`
+}
+
+type managementBanInfo struct {
+	AuthID           string `json:"auth_id"`
+	Window           string `json:"window"`
+	BannedAt         string `json:"banned_at,omitempty"`
+	BannedAtUnix     int64  `json:"banned_at_unix,omitempty"`
+	ResetAt          string `json:"reset_at"`
+	ResetAtUnix      int64  `json:"reset_at_unix"`
+	RemainingSeconds int64  `json:"remaining_seconds"`
+}
+
+func currentBanStatus() managementBanStatus {
+	now := time.Now()
+	banStore.clearExpired(now)
+	snapshot := banStore.snapshot()
+	bans := make([]managementBanInfo, 0, len(snapshot))
+	for authID, entry := range snapshot {
+		remaining := int64(0)
+		if now.Before(entry.ResetAt) {
+			remaining = int64(entry.ResetAt.Sub(now).Seconds())
+		}
+		info := managementBanInfo{
+			AuthID:           authID,
+			Window:           entry.Window,
+			ResetAt:          entry.ResetAt.Format(time.RFC3339),
+			ResetAtUnix:      entry.ResetAt.Unix(),
+			RemainingSeconds: remaining,
+		}
+		if !entry.BannedAt.IsZero() {
+			info.BannedAt = entry.BannedAt.Format(time.RFC3339)
+			info.BannedAtUnix = entry.BannedAt.Unix()
+		}
+		bans = append(bans, info)
+	}
+	sort.Slice(bans, func(i, j int) bool {
+		if bans[i].ResetAtUnix == bans[j].ResetAtUnix {
+			return bans[i].AuthID < bans[j].AuthID
+		}
+		return bans[i].ResetAtUnix < bans[j].ResetAtUnix
+	})
+	return managementBanStatus{
+		Plugin:  pluginName,
+		Version: pluginVersion,
+		Count:   len(bans),
+		Bans:    bans,
+	}
+}
+
+type managementUnbanRequest struct {
+	AuthID string `json:"auth_id"`
+	All    bool   `json:"all"`
+}
+
+func handleManagementUnban(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	var body managementUnbanRequest
+	if len(req.Body) > 0 {
+		if errUnmarshal := json.Unmarshal(req.Body, &body); errUnmarshal != nil {
+			return jsonManagementResponse(http.StatusBadRequest, map[string]any{
+				"error":   "invalid_json",
+				"message": errUnmarshal.Error(),
+			})
+		}
+	}
+	if strings.EqualFold(req.Query.Get("all"), "true") || body.All {
+		return handleManagementUnbanAll()
+	}
+
+	authID := strings.TrimSpace(body.AuthID)
+	if authID == "" {
+		authID = strings.TrimSpace(req.Query.Get("auth_id"))
+	}
+	if authID == "" {
+		return jsonManagementResponse(http.StatusBadRequest, map[string]any{
+			"error":   "missing_auth_id",
+			"message": "provide auth_id in JSON body or query string",
+		})
+	}
+
+	entry, removed := banStore.clear(authID)
+	if removed {
+		slog.Info("codex-429-autoban: manually re-enabled credential",
+			"auth_id", authID, "window", entry.Window, "reset_at", entry.ResetAt.Format(time.RFC3339))
+	}
+	return jsonManagementResponse(http.StatusOK, map[string]any{
+		"ok":      true,
+		"auth_id": authID,
+		"removed": removed,
+		"status":  currentBanStatus(),
+	})
+}
+
+func handleManagementUnbanAll() pluginapi.ManagementResponse {
+	removed := banStore.clearAll()
+	if removed > 0 {
+		slog.Info("codex-429-autoban: manually re-enabled all credentials", "removed", removed)
+	}
+	return jsonManagementResponse(http.StatusOK, map[string]any{
+		"ok":      true,
+		"removed": removed,
+		"status":  currentBanStatus(),
+	})
+}
+
+func matchesManagementPath(path, suffix string) bool {
+	path = strings.TrimRight(strings.TrimSpace(path), "/")
+	if path == "" {
+		return false
+	}
+	if !strings.HasPrefix(suffix, "/") {
+		suffix = "/" + suffix
+	}
+	return strings.HasSuffix(path, managementRoutePrefix+suffix)
+}
+
+func matchesResourcePath(path, suffix string) bool {
+	path = strings.TrimRight(strings.TrimSpace(path), "/")
+	if path == "" {
+		return false
+	}
+	if !strings.HasPrefix(suffix, "/") {
+		suffix = "/" + suffix
+	}
+	return strings.HasSuffix(path, "/v0/resource/plugins/"+pluginName+suffix) ||
+		strings.HasSuffix(path, "/plugins/"+pluginName+suffix)
+}
+
+func jsonManagementResponse(status int, v any) pluginapi.ManagementResponse {
+	raw, errMarshal := json.MarshalIndent(v, "", "  ")
+	if errMarshal != nil {
+		status = http.StatusInternalServerError
+		raw, _ = json.Marshal(map[string]any{
+			"error":   "marshal_error",
+			"message": errMarshal.Error(),
+		})
+	}
+	return pluginapi.ManagementResponse{
+		StatusCode: status,
+		Headers: http.Header{
+			"Content-Type": []string{"application/json; charset=utf-8"},
+		},
+		Body: raw,
+	}
+}
+
+func htmlManagementResponse(status int, body string) pluginapi.ManagementResponse {
+	return pluginapi.ManagementResponse{
+		StatusCode: status,
+		Headers: http.Header{
+			"Content-Type": []string{"text/html; charset=utf-8"},
+		},
+		Body: []byte(body),
+	}
+}
+
+func managementStatusPage() string {
+	version := html.EscapeString(pluginVersion)
+	return `<!doctype html>
+<html lang="zh-Hans">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>codex-429-autoban</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { max-width: 980px; margin: 32px auto; padding: 0 16px; line-height: 1.5; }
+    h1 { margin-bottom: 4px; }
+    .muted { color: #667085; }
+    .card { border: 1px solid #d0d7de; border-radius: 12px; padding: 16px; margin: 16px 0; }
+    label { display: block; font-weight: 600; margin-bottom: 6px; }
+    input { width: min(640px, 100%); padding: 8px 10px; border: 1px solid #d0d7de; border-radius: 8px; }
+    button { cursor: pointer; padding: 8px 12px; border: 1px solid #d0d7de; border-radius: 8px; margin: 4px 4px 4px 0; }
+    button.primary { background: #0969da; border-color: #0969da; color: white; }
+    button.danger { background: #cf222e; border-color: #cf222e; color: white; }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+    th, td { border-bottom: 1px solid #d0d7de; padding: 8px; text-align: left; vertical-align: top; }
+    code { background: rgba(127,127,127,.15); padding: 2px 4px; border-radius: 4px; }
+    pre { overflow: auto; background: rgba(127,127,127,.12); padding: 12px; border-radius: 8px; }
+  </style>
+</head>
+<body>
+  <h1>codex-429-autoban</h1>
+  <p class="muted">版本 ` + version + ` · 手动把已重置额度的 Codex 账号加回号池。</p>
+
+  <div class="card">
+    <p>资源页本身不带管理鉴权。要执行查看/解除操作，请填入 CPA 管理密钥；请求会使用 <code>Authorization: Bearer &lt;key&gt;</code>。</p>
+    <label for="key">CPA 管理密钥</label>
+    <input id="key" type="password" autocomplete="current-password" placeholder="Management key">
+    <div>
+      <button class="primary" onclick="refresh()">刷新当前 ban 列表</button>
+      <button class="danger" onclick="unbanAll()">全部加回号池</button>
+    </div>
+    <p id="message" class="muted"></p>
+  </div>
+
+  <div class="card">
+    <h2>当前被插件排除的账号</h2>
+    <div id="list">尚未加载。</div>
+  </div>
+
+  <div class="card">
+    <h2>API</h2>
+    <pre>GET  /v0/management/plugins/codex-429-autoban/bans
+POST /v0/management/plugins/codex-429-autoban/unban      {"auth_id":"..."}
+POST /v0/management/plugins/codex-429-autoban/unban-all</pre>
+  </div>
+
+  <script>
+    const apiBase = "/v0/management/plugins/codex-429-autoban";
+    const keyInput = document.getElementById("key");
+    const savedKey = localStorage.getItem("codex429AutobanManagementKey") || "";
+    keyInput.value = savedKey;
+    keyInput.addEventListener("change", function () {
+      localStorage.setItem("codex429AutobanManagementKey", keyInput.value);
+    });
+
+    function headers() {
+      const h = {"Content-Type": "application/json"};
+      if (keyInput.value) h.Authorization = "Bearer " + keyInput.value;
+      return h;
+    }
+
+    function setMessage(text, isError) {
+      const el = document.getElementById("message");
+      el.textContent = text || "";
+      el.style.color = isError ? "#cf222e" : "";
+    }
+
+    async function call(path, options) {
+      const resp = await fetch(apiBase + path, Object.assign({headers: headers()}, options || {}));
+      const text = await resp.text();
+      let data;
+      try { data = JSON.parse(text); } catch (_) { data = {raw: text}; }
+      if (!resp.ok) {
+        throw new Error((data && (data.message || data.error)) || ("HTTP " + resp.status));
+      }
+      return data;
+    }
+
+    function formatRemaining(seconds) {
+      seconds = Math.max(0, Number(seconds || 0));
+      const h = Math.floor(seconds / 3600);
+      const m = Math.floor((seconds % 3600) / 60);
+      if (h > 0) return h + "h " + m + "m";
+      return m + "m";
+    }
+
+    function render(data) {
+      const list = document.getElementById("list");
+      if (!data.bans || data.bans.length === 0) {
+        list.innerHTML = "<p>没有账号被插件 ban，号池无需手动恢复。</p>";
+        return;
+      }
+      let html = "<table><thead><tr><th>Auth ID</th><th>窗口</th><th>解除时间</th><th>剩余</th><th>操作</th></tr></thead><tbody>";
+      for (const ban of data.bans) {
+        html += "<tr><td><code>" + escapeHtml(ban.auth_id) + "</code></td><td>" + escapeHtml(ban.window) + "</td><td>" + escapeHtml(ban.reset_at) + "</td><td>" + formatRemaining(ban.remaining_seconds) + "</td><td><button onclick=\"unban('" + escapeJs(ban.auth_id) + "')\">加回号池</button></td></tr>";
+      }
+      html += "</tbody></table>";
+      list.innerHTML = html;
+    }
+
+    function escapeHtml(value) {
+      return String(value || "").replace(/[&<>"']/g, function (c) {
+        return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c];
+      });
+    }
+
+    function escapeJs(value) {
+      return String(value || "").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    }
+
+    async function refresh() {
+      try {
+        setMessage("加载中...");
+        const data = await call("/bans");
+        render(data);
+        setMessage("已刷新，共 " + data.count + " 个账号被排除。");
+      } catch (err) {
+        setMessage(err.message, true);
+      }
+    }
+
+    async function unban(authID) {
+      if (!confirm("确认将 " + authID + " 加回号池？")) return;
+      try {
+        const data = await call("/unban", {method: "POST", body: JSON.stringify({auth_id: authID})});
+        render(data.status);
+        setMessage(data.removed ? "已加回号池：" + authID : "该账号当前不在 ban 列表：" + authID);
+      } catch (err) {
+        setMessage(err.message, true);
+      }
+    }
+
+    async function unbanAll() {
+      if (!confirm("确认清空全部 ban 状态？")) return;
+      try {
+        const data = await call("/unban-all", {method: "POST", body: "{}"});
+        render(data.status);
+        setMessage("已解除 " + data.removed + " 个账号。");
+      } catch (err) {
+        setMessage(err.message, true);
+      }
+    }
+  </script>
+</body>
+</html>`
+}
+
 // ---- header helpers ----
 
 func headerFloat(h http.Header, key string) float64 {
@@ -459,8 +899,9 @@ type registration struct {
 }
 
 type registrationCapability struct {
-	UsagePlugin bool `json:"usage_plugin"`
-	Scheduler   bool `json:"scheduler"`
+	UsagePlugin   bool `json:"usage_plugin"`
+	Scheduler     bool `json:"scheduler"`
+	ManagementAPI bool `json:"management_api"`
 }
 
 func okEnvelope(v any) ([]byte, error) {
