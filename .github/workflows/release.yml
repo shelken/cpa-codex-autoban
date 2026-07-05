@@ -13,6 +13,7 @@
 name: Release Plugin
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - "v*"
