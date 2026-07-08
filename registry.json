@@ -2,7 +2,7 @@
   "schema_version": 1,
   "plugins": [
     {
-      "id": "codex-429-autoban",
+      "id": "cpa-codex-autoban",
       "name": "Codex 429 Autoban",
       "description": "Auto-disable Codex credentials after 429 and manually re-enable them after quota reset.",
       "author": "shelken",
