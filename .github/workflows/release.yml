@@ -7,6 +7,7 @@
 #
 # Output assets (version = tag without the leading "v"):
 #   cpa-codex-autoban_<version>_linux_amd64.zip      -> cpa-codex-autoban.so
+#   cpa-codex-autoban_<version>_linux_arm64.zip      -> cpa-codex-autoban.so
 #   cpa-codex-autoban_<version>_darwin_arm64.zip     -> cpa-codex-autoban.dylib
 #   cpa-codex-autoban_<version>_windows_amd64.zip    -> cpa-codex-autoban.dll
 #   checksums.txt
@@ -32,6 +33,10 @@ jobs:
           - goos: linux
             goarch: amd64
             runner: ubuntu-latest
+            ext: so
+          - goos: linux
+            goarch: arm64
+            runner: ubuntu-24.04-arm
             ext: so
           - goos: darwin
             goarch: arm64
