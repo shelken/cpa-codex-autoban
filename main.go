@@ -68,7 +68,7 @@ import (
 
 const (
 	pluginName    = "cpa-codex-autoban"
-	pluginVersion = "0.2.1"
+	pluginVersion = "0.2.2"
 
 	// providerCodex is the CPA provider key for OpenAI Codex (ChatGPT backend).
 	providerCodex = "codex"
